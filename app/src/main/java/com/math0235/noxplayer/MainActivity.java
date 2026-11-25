@@ -2,14 +2,17 @@ package com.math0235.noxplayer;
 
 import android.Manifest;
 import android.app.Activity;
-import android.app.AlertDialog;
+import android.app.PendingIntent;
+import android.content.ContentValues;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.database.ContentObserver;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
-import android.graphics.LinearGradient;
-import android.graphics.Shader;
+import android.media.RingtoneManager;
+import android.media.audiofx.BassBoost;
+import android.media.audiofx.Equalizer;
+import android.media.audiofx.Visualizer;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -17,130 +20,143 @@ import android.os.Handler;
 import android.os.Looper;
 import android.provider.MediaStore;
 import android.provider.Settings;
-import android.text.Editable;
-import android.text.TextWatcher;
-import android.view.Gravity;
-import android.view.View;
-import android.view.ViewGroup;
-import android.widget.BaseAdapter;
-import android.widget.EditText;
-import android.widget.FrameLayout;
-import android.widget.HorizontalScrollView;
-import android.widget.LinearLayout;
-import android.widget.ListView;
-import android.widget.ProgressBar;
-import android.widget.TextView;
+import android.webkit.JavascriptInterface;
+import android.webkit.WebResourceRequest;
+import android.webkit.WebResourceResponse;
+import android.webkit.WebSettings;
+import android.webkit.WebView;
+import android.webkit.WebViewClient;
+import android.widget.Toast;
 
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import java.io.BufferedReader;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileOutputStream;
+import java.io.FileReader;
 import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 
+/**
+ * Pont Java minimal : héberge l'interface JavaScript (assets/web) dans une WebView verrouillée
+ * et lui donne accès au lecteur, à la bibliothèque et au cœur C++.
+ * Toute l'interface est en JavaScript ; ce fichier ne contient aucune logique d'écran.
+ */
 public class MainActivity extends Activity implements PlayerService.Listener {
-    private static final String[] TABS = {"Chansons", "Playlists", "Albums", "Artistes", "Dossiers", "Favoris", "Récents"};
-    private static final int T_SONGS = 0, T_PLAYLISTS = 1, T_ALBUMS = 2, T_ARTISTS = 3, T_FOLDERS = 4, T_FAVS = 5, T_RECENT = 6;
-    private static final int REQ_PERM = 1, REQ_COVER = 2, REQ_IMPORT = 3, REQ_VIDEO = 4;
+    private static final String HOST = "nox.local";
+    private static final String ORIGIN = "https://" + HOST;
+    private static final int REQ_PERM = 1, REQ_COVER = 2, REQ_IMPORT = 3, REQ_VIDEO = 4,
+            REQ_SAVE = 5, REQ_RESTORE = 6, REQ_DELETE = 7, REQ_MIC = 8;
 
-    private static final int R_TRACK = 0, R_GROUP = 1, R_PLAYLIST = 2, R_NEWPL = 3, R_ADD = 4;
-
-    static final class Row {
-        final int type;
-        Track track;
-        String name, sub;
-        List<Track> tracks;
-        Row(int t) { type = t; }
-    }
-
-    /** Mis à true par les paramètres quand la bibliothèque doit être rescannée. */
-    public static boolean needsReload;
-    private int themeSeen;
-
-    private int tab = T_SONGS;
-    private String query = "";
-    private String detailName;
-    private List<Track> detailTracks;
-    private boolean detailPlaylist;
-    private boolean loaded, loading;
-    private Track coverTarget;
-
-    private final List<TextView> tabViews = new ArrayList<>();
-    private TextView backBar, shuffleBtn, emptyView;
-    private EditText search;
-    private ListView list;
-    private final RowAdapter adapter = new RowAdapter();
-    private final List<Track> shownTracks = new ArrayList<>();
-
-    private LinearLayout mini;
-    private CoverView miniCover;
-    private TextView miniTitle, miniSub;
-    private IconView miniPlay;
-    private ProgressBar miniProg;
-
+    private WebView web;
     private final Handler h = new Handler(Looper.getMainLooper());
-    private final Runnable tick = new Runnable() {
-        @Override public void run() { updateMiniProgress(); h.postDelayed(this, 1000); }
-    };
-    private final Runnable reload = this::loadMedia;
     private ContentObserver observer;
+    private boolean loading, ready;
+    private long coverTargetId = -1;
+    private List<Track> pendingDelete;
+    private Visualizer viz;
+    private final float[] vizLevels = new float[48];
+    private long lastVizPush;
+    private final Map<Long, Track> extTracks = new HashMap<>();
+
+    private final Runnable reload = this::loadMedia;
+    private final Runnable tick = new Runnable() {
+        @Override public void run() {
+            PlayerService s = PlayerService.get();
+            if (s != null && s.isPlaying()) emit("tick", stateJson().toString());
+            h.postDelayed(this, 500);
+        }
+    };
 
     // =================================================================== Cycle de vie
     @Override
+    @SuppressWarnings("SetJavaScriptEnabled")
     protected void onCreate(Bundle b) {
         super.onCreate(b);
-        if (!Guard.isOfficial(this)) { showTampered(); return; }
-        Ui.loadTheme(this);
-        themeSeen = Ui.themeVersion;
-        getWindow().setStatusBarColor(Ui.BG);
-        getWindow().setNavigationBarColor(Ui.BG);
-        setContentView(buildUi());
+        getWindow().setStatusBarColor(0xFF0B0714);
+        getWindow().setNavigationBarColor(0xFF0B0714);
+        web = new WebView(this);
+        web.setBackgroundColor(0xFF0B0714);
+        setContentView(web);
+
+        if (!Native.ok(this)) {
+            // Copie modifiée / re-signée : on n'exécute rien de l'appli.
+            web.loadDataWithBaseURL(null, "<html><body style='background:#8B0000;color:#fff;font-family:sans-serif;"
+                    + "display:flex;align-items:center;justify-content:center;height:90vh;text-align:center;padding:24px'>"
+                    + "<div><h1>⚠</h1><h2>Cette copie de NOX Player a été modifiée.</h2>"
+                    + "<p>Elle n'est pas signée par math_0235 et peut contenir un virus.<br>"
+                    + "Désinstalle-la et télécharge uniquement la version officielle.</p></div></body></html>",
+                    "text/html", "utf-8", null);
+            return;
+        }
+
+        WebSettings ws = web.getSettings();
+        ws.setJavaScriptEnabled(true);
+        ws.setDomStorageEnabled(true);
+        ws.setAllowFileAccess(false);
+        ws.setAllowContentAccess(false);
+        ws.setMediaPlaybackRequiresUserGesture(true);
+        ws.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
+        ws.setSupportZoom(false);
+        ws.setTextZoom(100);
+        web.setOverScrollMode(WebView.OVER_SCROLL_NEVER);
+        web.setVerticalScrollBarEnabled(false);
+        web.addJavascriptInterface(new Bridge(), "NOX");
+        web.setWebViewClient(new WebViewClient() {
+            @Override
+            public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest r) {
+                return true; // aucune navigation vers l'extérieur : l'interface ne peut pas être détournée
+            }
+
+            @Override
+            public WebResourceResponse shouldInterceptRequest(WebView v, WebResourceRequest r) {
+                return serve(r.getUrl());
+            }
+
+            @Override
+            public void onPageFinished(WebView v, String url) {
+                ready = true;
+                if (hasPerm()) loadMedia(); else emit("perm", "false");
+                handleIntent(getIntent());
+            }
+        });
+
         observer = new ContentObserver(h) {
-            @Override public void onChange(boolean selfChange) {
-                // Nouveau fichier sur le téléphone -> on rescanne (avec un petit délai pour regrouper)
+            @Override public void onChange(boolean self) {
                 h.removeCallbacks(reload);
                 h.postDelayed(reload, 1500);
             }
         };
         getContentResolver().registerContentObserver(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, true, observer);
         getContentResolver().registerContentObserver(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, true, observer);
-        if (hasPerm()) loadMedia(); else askPerm();
-        handleIntent(getIntent());
-    }
-
-    /** Écran bloquant si l'APK a été modifié / re-signé par quelqu'un d'autre. */
-    private void showTampered() {
-        android.widget.TextView t = Ui.text(this, "⚠\n\nCette copie de NOX Player a été modifiée.\n\n"
-                + "Elle n'est pas signée par math_0235 et peut contenir un virus.\n"
-                + "Désinstalle-la et utilise uniquement la version officielle.", 17, 0xFFFFFFFF, true);
-        t.setGravity(Gravity.CENTER);
-        t.setPadding(Ui.dp(this, 32), 0, Ui.dp(this, 32), 0);
-        t.setBackgroundColor(0xFF8B0000);
-        setContentView(t);
-        observer = null;
+        web.loadUrl(ORIGIN + "/index.html");
     }
 
     @Override
-    protected void onNewIntent(Intent intent) {
-        super.onNewIntent(intent);
-        if (!Guard.isOfficial(this)) return;
-        setIntent(intent);
-        handleIntent(intent);
+    protected void onNewIntent(Intent i) {
+        super.onNewIntent(i);
+        setIntent(i);
+        if (Native.ok(this)) handleIntent(i);
     }
 
     @Override
     protected void onResume() {
         super.onResume();
-        if (!Guard.isOfficial(this)) return;
-        if (themeSeen != Ui.themeVersion) { recreate(); return; }
-        if (needsReload) { needsReload = false; loadMedia(); }
+        if (!Native.ok(this)) return;
         PlayerService.addListener(this);
-        onPlayerChanged();
         h.post(tick);
-        if (loaded) refresh();
+        if (ready) { emit("state", stateJson().toString()); emit("resume", "{}"); }
     }
 
     @Override
@@ -148,40 +164,105 @@ public class MainActivity extends Activity implements PlayerService.Listener {
         super.onPause();
         PlayerService.removeListener(this);
         h.removeCallbacks(tick);
+        stopViz();
     }
 
     @Override
     protected void onDestroy() {
         if (observer != null) getContentResolver().unregisterContentObserver(observer);
         h.removeCallbacksAndMessages(null);
+        if (web != null) web.destroy();
         super.onDestroy();
     }
 
     @Override
     @SuppressWarnings("deprecation")
     public void onBackPressed() {
-        if (detailTracks != null) { closeDetail(); return; }
-        if (!query.isEmpty()) { search.setText(""); return; }
-        if (search.getVisibility() == View.VISIBLE) { search.setVisibility(View.GONE); return; }
-        super.onBackPressed();
+        if (!ready) { super.onBackPressed(); return; }
+        web.evaluateJavascript("window.NOX_back ? NOX_back() : false", v -> {
+            if (!"true".equals(v)) moveTaskToBack(true);
+        });
     }
 
-    /** "Ouvrir avec NOX Player" depuis une autre appli. */
+    @Override
+    public void onPlayerChanged() {
+        if (ready) emit("state", stateJson().toString());
+    }
+
     private void handleIntent(Intent i) {
-        if (i == null || !Intent.ACTION_VIEW.equals(i.getAction()) || i.getData() == null) return;
+        if (i == null) return;
+        if (i.getBooleanExtra("openPlayer", false)) { emit("open", "\"player\""); i.removeExtra("openPlayer"); }
+        if (!Intent.ACTION_VIEW.equals(i.getAction()) || i.getData() == null) return;
         Uri u = i.getData();
-        String type = i.getType();
-        if (type == null) type = getContentResolver().getType(u);
+        String type = i.getType() != null ? i.getType() : getContentResolver().getType(u);
         if (type != null && type.startsWith("video")) {
-            ToolsUi.convertToAudio(this, Track.fromUri(this, u, true));
+            convertVideo(Track.fromUri(this, u, true));
         } else {
-            PlayerService.playQueue(this, Collections.singletonList(Track.fromUri(this, u, false)), 0);
-            startActivity(new Intent(this, PlayerActivity.class));
+            Track t = Track.fromUri(this, u, false);
+            t.id = -1000 - extTracks.size();
+            extTracks.put(t.id, t);
+            PlayerService.playQueue(this, Collections.singletonList(t), 0);
+            emit("open", "\"player\"");
         }
         i.setAction(null);
     }
 
-    // =================================================================== Permissions
+    // =================================================================== JS <- Java
+    private void emit(String type, String json) {
+        if (web == null) return;
+        String js = "window.NOX_event && NOX_event(" + JSONObject.quote(type) + "," + json + ")";
+        if (Looper.myLooper() == Looper.getMainLooper()) web.evaluateJavascript(js, null);
+        else h.post(() -> web.evaluateJavascript(js, null));
+    }
+
+    private void toast(String s) {
+        h.post(() -> Toast.makeText(this, s, Toast.LENGTH_SHORT).show());
+    }
+
+    // =================================================================== Fichiers servis à la WebView
+    private WebResourceResponse serve(Uri u) {
+        if (u == null || !HOST.equals(u.getHost())) {
+            return new WebResourceResponse("text/plain", "utf-8", 403, "Forbidden", null, new ByteArrayInputStream(new byte[0]));
+        }
+        String path = u.getPath() == null ? "/" : u.getPath();
+        try {
+            if (path.startsWith("/art/")) {
+                long id = Long.parseLong(path.substring(5));
+                int size = 300;
+                try { size = Math.max(64, Math.min(800, Integer.parseInt(u.getQueryParameter("s")))); } catch (Exception ignored) {}
+                Track t = id < 0 ? extTracks.get(id) : MediaRepo.get(id);
+                Bitmap bm = t == null ? null : ArtLoader.decode(this, t, size);
+                if (bm == null) return notFound();
+                ByteArrayOutputStream bo = new ByteArrayOutputStream();
+                bm.compress(Bitmap.CompressFormat.JPEG, 88, bo);
+                WebResourceResponse r = new WebResourceResponse("image/jpeg", null, new ByteArrayInputStream(bo.toByteArray()));
+                Map<String, String> hd = new HashMap<>();
+                hd.put("Cache-Control", "max-age=86400");
+                r.setResponseHeaders(hd);
+                return r;
+            }
+            if (path.equals("/") || path.contains("..")) path = "/index.html";
+            String mime = path.endsWith(".html") ? "text/html" : path.endsWith(".js") ? "application/javascript"
+                    : path.endsWith(".css") ? "text/css" : path.endsWith(".jpg") ? "image/jpeg"
+                    : path.endsWith(".png") ? "image/png" : path.endsWith(".svg") ? "image/svg+xml" : "application/octet-stream";
+            InputStream in = getAssets().open("web" + path);
+            WebResourceResponse r = new WebResourceResponse(mime, "utf-8", in);
+            Map<String, String> hd = new HashMap<>();
+            hd.put("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
+                    + "script-src 'self'; connect-src 'none'; object-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'");
+            hd.put("X-Content-Type-Options", "nosniff");
+            r.setResponseHeaders(hd);
+            return r;
+        } catch (Exception e) {
+            return notFound();
+        }
+    }
+
+    private static WebResourceResponse notFound() {
+        return new WebResourceResponse("text/plain", "utf-8", 404, "Not Found", null, new ByteArrayInputStream(new byte[0]));
+    }
+
+    // =================================================================== Bibliothèque
     private boolean hasPerm() {
         String p = Build.VERSION.SDK_INT >= 33 ? Manifest.permission.READ_MEDIA_AUDIO : Manifest.permission.READ_EXTERNAL_STORAGE;
         return checkSelfPermission(p) == PackageManager.PERMISSION_GRANTED;
@@ -189,630 +270,232 @@ public class MainActivity extends Activity implements PlayerService.Listener {
 
     private void askPerm() {
         String[] perms;
-        if (Build.VERSION.SDK_INT >= 33) {
-            perms = new String[]{Manifest.permission.READ_MEDIA_AUDIO, Manifest.permission.READ_MEDIA_VIDEO,
-                    Manifest.permission.POST_NOTIFICATIONS};
-        } else if (Build.VERSION.SDK_INT >= 29) {
-            perms = new String[]{Manifest.permission.READ_EXTERNAL_STORAGE};
-        } else {
-            perms = new String[]{Manifest.permission.READ_EXTERNAL_STORAGE, Manifest.permission.WRITE_EXTERNAL_STORAGE};
-        }
+        if (Build.VERSION.SDK_INT >= 33) perms = new String[]{Manifest.permission.READ_MEDIA_AUDIO,
+                Manifest.permission.READ_MEDIA_VIDEO, Manifest.permission.POST_NOTIFICATIONS};
+        else if (Build.VERSION.SDK_INT >= 29) perms = new String[]{Manifest.permission.READ_EXTERNAL_STORAGE};
+        else perms = new String[]{Manifest.permission.READ_EXTERNAL_STORAGE, Manifest.permission.WRITE_EXTERNAL_STORAGE};
         requestPermissions(perms, REQ_PERM);
-        refresh();
     }
 
     @Override
     public void onRequestPermissionsResult(int code, String[] p, int[] r) {
-        if (hasPerm()) loadMedia(); else refresh();
+        if (code == REQ_MIC) { startViz(); return; }
+        if (hasPerm()) loadMedia(); else emit("perm", "false");
     }
 
     private void loadMedia() {
-        if (!hasPerm() || loading) return;
+        if (!hasPerm() || loading || !ready) return;
         loading = true;
-        if (!loaded) refresh();
         new Thread(() -> {
             MediaRepo.load(this);
-            runOnUiThread(() -> {
+            String lib = libraryJson().toString();
+            h.post(() -> {
                 loading = false;
-                loaded = true;
-                refresh();
+                emit("library", lib);
                 checkAutoConvert();
             });
         }).start();
     }
 
-    /** Option : les nouvelles vidéos arrivées sur le téléphone sont converties en audio automatiquement. */
+    private JSONObject trackJson(Track t) {
+        JSONObject o = new JSONObject();
+        try {
+            o.put("id", t.id).put("title", t.title).put("artist", t.artist).put("album", t.album)
+                    .put("folder", t.folder).put("path", t.path).put("duration", t.duration)
+                    .put("added", t.dateAdded).put("art", "/art/" + t.id + "?v=" + t.coverStamp)
+                    .put("custom", t.customCover(this) != null);
+        } catch (Exception ignored) {}
+        return o;
+    }
+
+    private JSONObject libraryJson() {
+        JSONObject o = new JSONObject();
+        try {
+            JSONArray songs = new JSONArray(), hid = new JSONArray(), tr = new JSONArray();
+            List<Track> copy;
+            synchronized (MediaRepo.class) { copy = new ArrayList<>(MediaRepo.songs); }
+            for (Track t : copy) songs.put(trackJson(t).put("plays", Store.plays(this, t.id)));
+            for (Track t : new ArrayList<>(MediaRepo.hidden)) hid.put(trackJson(t));
+            for (Track t : new ArrayList<>(MediaRepo.trash)) tr.put(trackJson(t));
+            JSONArray favs = new JSONArray();
+            for (Long id : Store.favs(this)) favs.put(id.longValue());
+            JSONArray recent = new JSONArray();
+            for (Long id : Store.recent(this)) recent.put(id.longValue());
+            JSONObject pls = new JSONObject();
+            LinkedHashMap<String, List<Long>> m = Store.playlists(this);
+            for (String k : m.keySet()) {
+                JSONArray a = new JSONArray();
+                for (Long id : m.get(k)) a.put(id.longValue());
+                pls.put(k, a);
+            }
+            o.put("songs", songs).put("hidden", hid).put("trash", tr).put("favs", favs)
+                    .put("recent", recent).put("playlists", pls).put("videos", MediaRepo.videos.size());
+        } catch (Exception ignored) {}
+        return o;
+    }
+
+    private JSONObject stateJson() {
+        JSONObject o = new JSONObject();
+        PlayerService s = PlayerService.get();
+        try {
+            if (s == null || s.current() == null) return o.put("cur", JSONObject.NULL);
+            Track t = s.current();
+            if (t.id < 0) extTracks.put(t.id, t);
+            JSONArray q = new JSONArray();
+            for (Track x : s.orderedQueue()) q.put(trackJson(x));
+            o.put("cur", trackJson(t)).put("playing", s.isPlaying()).put("pos", s.position())
+                    .put("dur", s.duration()).put("mode", s.mode()).put("speed", (double) s.speed())
+                    .put("sleep", s.sleepRemaining()).put("queue", q).put("qpos", s.queuePosition())
+                    .put("fav", t.id >= 0 && Store.isFav(this, t.id));
+        } catch (Exception ignored) {}
+        return o;
+    }
+
+    private Track find(long id) {
+        Track t = MediaRepo.get(id);
+        if (t != null) return t;
+        if (extTracks.containsKey(id)) return extTracks.get(id);
+        for (Track x : new ArrayList<>(MediaRepo.hidden)) if (x.id == id) return x;
+        for (Track x : new ArrayList<>(MediaRepo.trash)) if (x.id == id) return x;
+        return null;
+    }
+
     private void checkAutoConvert() {
         int newest = 0;
         for (Track v : MediaRepo.videos) newest = (int) Math.max(newest, v.dateAdded);
         int seen = Store.getInt(this, "video_seen", -1);
-        if (seen < 0 || !Store.getBool(this, "auto_audio", false)) {
-            Store.putInt(this, "video_seen", newest);
-            return;
-        }
-        for (Track v : MediaRepo.videos) if (v.dateAdded > seen) ToolsUi.autoConvert(this, v);
+        if (seen < 0 || !Store.getBool(this, "auto_audio", false)) { Store.putInt(this, "video_seen", newest); return; }
+        for (Track v : MediaRepo.videos) if (v.dateAdded > seen) convertVideo(v);
         Store.putInt(this, "video_seen", Math.max(seen, newest));
     }
 
-    // =================================================================== Interface
-    private View buildUi() {
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setBackgroundColor(Ui.BG);
-        int d16 = Ui.dp(this, 16);
-
-        // --- En-tête
-        LinearLayout header = new LinearLayout(this);
-        header.setGravity(Gravity.CENTER_VERTICAL);
-        header.setPadding(Ui.dp(this, 20), Ui.dp(this, 18), Ui.dp(this, 8), Ui.dp(this, 8));
-        int logoId = getResources().getIdentifier("nox_logo", "drawable", getPackageName());
-        if (logoId != 0) {
-            android.widget.ImageView logo = new android.widget.ImageView(this);
-            logo.setImageResource(logoId);
-            logo.setScaleType(android.widget.ImageView.ScaleType.CENTER_CROP);
-            logo.setBackground(Ui.round(0xFF1B1B1C, Ui.dp(this, 12)));
-            logo.setClipToOutline(true);
-            int ls = Ui.dp(this, 42);
-            LinearLayout.LayoutParams llp = new LinearLayout.LayoutParams(ls, ls);
-            llp.rightMargin = Ui.dp(this, 12);
-            header.addView(logo, llp);
-        }
-        LinearLayout tcol = new LinearLayout(this);
-        tcol.setOrientation(LinearLayout.VERTICAL);
-        TextView title = Ui.text(this, "NOX Player", 25, Ui.TEXT, true);
-        float w = title.getPaint().measureText("NOX Player");
-        title.getPaint().setShader(new LinearGradient(0, 0, w, 0, Ui.ACCENT, Ui.ACCENT2, Shader.TileMode.CLAMP));
-        tcol.addView(title);
-        tcol.addView(Ui.text(this, "fait par math_0235", 11, Ui.SUB, false));
-        header.addView(tcol, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
-        int ib = Ui.dp(this, 44);
-        header.addView(Ui.button(this, "🔍", 19, v -> {
-            if (search.getVisibility() == View.VISIBLE && query.isEmpty()) { search.setVisibility(View.GONE); hideKeyboard(); }
-            else {
-                search.setVisibility(View.VISIBLE);
-                search.requestFocus();
-                ((android.view.inputmethod.InputMethodManager) getSystemService(INPUT_METHOD_SERVICE))
-                        .showSoftInput(search, 0);
-            }
-        }), new LinearLayout.LayoutParams(ib, ib));
-        header.addView(Ui.button(this, "⇅", 22, v -> sortSheet()), new LinearLayout.LayoutParams(ib, ib));
-        header.addView(Ui.button(this, "⚙", 22, v -> startActivity(new Intent(this, SettingsActivity.class))),
-                new LinearLayout.LayoutParams(ib, ib));
-        root.addView(header);
-
-        // --- Recherche
-        search = new EditText(this);
-        search.setHint("🔍  Rechercher une chanson, un artiste…");
-        search.setSingleLine(true);
-        search.setTextSize(15);
-        search.setTextColor(Ui.TEXT);
-        search.setHintTextColor(Ui.SUB);
-        search.setBackground(Ui.round(Ui.CARD, Ui.dp(this, 14)));
-        search.setPadding(d16, Ui.dp(this, 11), d16, Ui.dp(this, 11));
-        search.addTextChangedListener(new TextWatcher() {
-            @Override public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
-            @Override public void onTextChanged(CharSequence s, int a, int b, int c) {}
-            @Override public void afterTextChanged(Editable s) {
-                query = s.toString().trim().toLowerCase(Locale.ROOT);
-                refresh();
+    private void convertVideo(Track v) {
+        emit("progress", "{\"title\":" + JSONObject.quote("Conversion en audio…") + ",\"pct\":0}");
+        MediaTools.extractAudio(this, v, new MediaTools.Callback() {
+            @Override public void progress(int p) { emit("progress", "{\"title\":" + JSONObject.quote("Conversion en audio…") + ",\"pct\":" + p + "}"); }
+            @Override public void done(Uri out, String err) {
+                emit("progress", "{\"done\":true}");
+                toast(err != null ? err : "✓ « " + v.title + " » ajouté à ta musique");
             }
         });
-        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        slp.setMargins(d16, 0, d16, Ui.dp(this, 8));
-        search.setVisibility(View.GONE);
-        root.addView(search, slp);
-
-        // --- Onglets
-        HorizontalScrollView hs = new HorizontalScrollView(this);
-        hs.setHorizontalScrollBarEnabled(false);
-        LinearLayout tabBar = new LinearLayout(this);
-        tabBar.setPadding(Ui.dp(this, 12), Ui.dp(this, 4), Ui.dp(this, 12), Ui.dp(this, 8));
-        for (int i = 0; i < TABS.length; i++) {
-            final int idx = i;
-            TextView t = Ui.chip(this, TABS[i], v -> {
-                tab = idx;
-                detailTracks = null;
-                styleTabs();
-                refresh();
-                list.setSelection(0);
-            });
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-            lp.setMargins(Ui.dp(this, 4), 0, Ui.dp(this, 4), 0);
-            tabBar.addView(t, lp);
-            tabViews.add(t);
-        }
-        hs.addView(tabBar);
-        root.addView(hs);
-        styleTabs();
-
-        // --- Barre retour (dans un album / playlist)
-        backBar = Ui.text(this, "", 17, Ui.TEXT, true);
-        backBar.setPadding(Ui.dp(this, 20), Ui.dp(this, 6), d16, Ui.dp(this, 6));
-        backBar.setBackground(Ui.ripple(null));
-        backBar.setOnClickListener(v -> closeDetail());
-        backBar.setVisibility(View.GONE);
-        root.addView(backBar);
-
-        // --- Lecture aléatoire
-        shuffleBtn = Ui.text(this, "", 14, Ui.TEXT, true);
-        shuffleBtn.setGravity(Gravity.CENTER);
-        shuffleBtn.setPadding(d16, Ui.dp(this, 11), d16, Ui.dp(this, 11));
-        shuffleBtn.setBackground(Ui.ripple(Ui.gradient(Ui.ACCENT, 0xFF6A3DFF, Ui.dp(this, 24))));
-        shuffleBtn.setOnClickListener(v -> shuffleAll());
-        LinearLayout.LayoutParams sh = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        sh.setMargins(d16, Ui.dp(this, 2), d16, Ui.dp(this, 6));
-        root.addView(shuffleBtn, sh);
-
-        // --- Liste
-        FrameLayout listBox = new FrameLayout(this);
-        list = new ListView(this);
-        list.setDivider(null);
-        list.setSelector(new android.graphics.drawable.ColorDrawable(0));
-        list.setAdapter(adapter);
-        list.setOnItemClickListener((p, v, pos, id) -> onRowClick(adapter.get(pos)));
-        list.setOnItemLongClickListener((p, v, pos, id) -> { onRowLongClick(adapter.get(pos)); return true; });
-        listBox.addView(list);
-        emptyView = Ui.text(this, "", 15, Ui.SUB, false);
-        emptyView.setGravity(Gravity.CENTER);
-        emptyView.setPadding(Ui.dp(this, 32), 0, Ui.dp(this, 32), 0);
-        emptyView.setOnClickListener(v -> {
-            if (hasPerm()) return;
-            if (Build.VERSION.SDK_INT >= 23 && !shouldShowRequestPermissionRationale(
-                    Build.VERSION.SDK_INT >= 33 ? Manifest.permission.READ_MEDIA_AUDIO : Manifest.permission.READ_EXTERNAL_STORAGE)
-                    && Store.getBool(this, "asked", false)) {
-                startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + getPackageName())));
-            } else {
-                Store.putBool(this, "asked", true);
-                askPerm();
-            }
-        });
-        listBox.addView(emptyView, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-        root.addView(listBox, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1));
-
-        root.addView(buildMini());
-        return root;
     }
 
-    private View buildMini() {
-        mini = new LinearLayout(this);
-        mini.setOrientation(LinearLayout.VERTICAL);
-        mini.setBackground(Ui.gradient(Ui.CARD2, Ui.CARD, Ui.dp(this, 18)));
-        LinearLayout.LayoutParams mlp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        int m = Ui.dp(this, 10);
-        mlp.setMargins(m, m / 2, m, m);
-        mini.setLayoutParams(mlp);
-        mini.setClipToOutline(true);
-
-        miniProg = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
-        miniProg.setMax(1000);
-        miniProg.setProgressTintList(android.content.res.ColorStateList.valueOf(Ui.ACCENT2));
-        mini.addView(miniProg, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, Ui.dp(this, 3)));
-
-        LinearLayout row = new LinearLayout(this);
-        row.setGravity(Gravity.CENTER_VERTICAL);
-        row.setPadding(m, m, m / 2, m);
-        miniCover = new CoverView(this, 10, 18);
-        int cs = Ui.dp(this, 46);
-        row.addView(miniCover, new LinearLayout.LayoutParams(cs, cs));
-        LinearLayout col = new LinearLayout(this);
-        col.setOrientation(LinearLayout.VERTICAL);
-        col.setPadding(m, 0, m, 0);
-        miniTitle = Ui.text(this, "", 15, Ui.TEXT, true);
-        miniTitle.setSingleLine(true);
-        miniTitle.setEllipsize(android.text.TextUtils.TruncateAt.END);
-        miniSub = Ui.text(this, "", 12, Ui.SUB, false);
-        miniSub.setSingleLine(true);
-        miniSub.setEllipsize(android.text.TextUtils.TruncateAt.END);
-        col.addView(miniTitle);
-        col.addView(miniSub);
-        row.addView(col, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
-        int bs = Ui.dp(this, 46);
-        miniPlay = new IconView(this, IconView.PLAY, Ui.TEXT);
-        miniPlay.setRing(0f);
-        miniPlay.setBackground(Ui.ripple(null));
-        miniPlay.setOnClickListener(v -> { PlayerService s = PlayerService.get(); if (s != null) s.toggle(); });
-        LinearLayout.LayoutParams plp = new LinearLayout.LayoutParams(bs, bs);
-        plp.rightMargin = Ui.dp(this, 4);
-        row.addView(miniPlay, plp);
-        IconView next = new IconView(this, IconView.NEXT, Ui.TEXT);
-        next.setBackground(Ui.ripple(null));
-        next.setOnClickListener(v -> { PlayerService s = PlayerService.get(); if (s != null) s.next(true); });
-        row.addView(next, new LinearLayout.LayoutParams(Ui.dp(this, 40), bs));
-        mini.addView(row);
-        mini.setOnClickListener(v -> startActivity(new Intent(this, PlayerActivity.class)));
-        mini.setVisibility(View.GONE);
-        return mini;
-    }
-
-    private void styleTabs() {
-        for (int i = 0; i < tabViews.size(); i++) {
-            TextView t = tabViews.get(i);
-            boolean sel = i == tab;
-            t.setBackground(Ui.ripple(sel ? Ui.gradient(Ui.ACCENT, 0xFF6A3DFF, Ui.dp(this, 20)) : Ui.round(Ui.CARD, Ui.dp(this, 20))));
-            t.setTextColor(sel ? Ui.TEXT : Ui.SUB);
-        }
-    }
-
-    // =================================================================== Contenu
-    private boolean match(Track t) {
-        if (query.isEmpty()) return true;
-        return t.title.toLowerCase(Locale.ROOT).contains(query)
-                || t.artist.toLowerCase(Locale.ROOT).contains(query)
-                || t.album.toLowerCase(Locale.ROOT).contains(query);
-    }
-
-    private void addTracks(List<Row> rows, List<Track> tracks) {
-        for (Track t : tracks) {
-            if (!match(t)) continue;
-            Row r = new Row(R_TRACK);
-            r.track = t;
-            rows.add(r);
-        }
-    }
-
-    private void addGroups(List<Row> rows, Map<String, List<Track>> groups, int mode) {
-        for (Map.Entry<String, List<Track>> e : groups.entrySet()) {
-            String name = e.getKey();
-            List<Track> l = e.getValue();
-            if (!query.isEmpty() && !name.toLowerCase(Locale.ROOT).contains(query)) continue;
-            Row r = new Row(R_GROUP);
-            r.name = name;
-            r.tracks = l;
-            String n = l.size() + (l.size() > 1 ? " titres" : " titre");
-            r.sub = mode == MediaRepo.BY_ALBUM ? l.get(0).artist + "  ·  " + n : n;
-            rows.add(r);
-        }
-    }
-
-    private void refresh() {
-        List<Row> rows = new ArrayList<>();
-        shownTracks.clear();
-        if (!hasPerm()) {
-            show(rows, "🎵\n\nNOX Player a besoin d'accéder à ta musique et tes vidéos.\n\nAppuie ici pour autoriser.");
+    // =================================================================== Visualiseur (son -> C++ -> JS)
+    private void startViz() {
+        PlayerService s = PlayerService.get();
+        if (viz != null || s == null) return;
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            emit("viz", "null");
             return;
         }
-        if (!loaded) {
-            show(rows, "Recherche de ta musique…");
-            return;
-        }
-        if (detailTracks != null) {
-            if (detailPlaylist) {
-                List<Long> ids = Store.playlists(this).get(detailName);
-                detailTracks = MediaRepo.byIds(ids == null ? new ArrayList<>() : ids);
-            }
-            backBar.setText("←   " + detailName);
-            backBar.setVisibility(View.VISIBLE);
-            addTracks(rows, detailTracks);
-        } else {
-            backBar.setVisibility(View.GONE);
-            switch (tab) {
-                case T_SONGS:
-                    if (query.isEmpty()) rows.add(new Row(R_ADD));
-                    addTracks(rows, MediaRepo.sorted(this, MediaRepo.songs,
-                            Store.getInt(this, "sort", 0), Store.getBool(this, "sort_rev", false)));
-                    break;
-                case T_ALBUMS: addGroups(rows, MediaRepo.group(MediaRepo.songs, MediaRepo.BY_ALBUM), MediaRepo.BY_ALBUM); break;
-                case T_ARTISTS: addGroups(rows, MediaRepo.group(MediaRepo.songs, MediaRepo.BY_ARTIST), MediaRepo.BY_ARTIST); break;
-                case T_FOLDERS: addGroups(rows, MediaRepo.group(MediaRepo.songs, MediaRepo.BY_FOLDER), MediaRepo.BY_FOLDER); break;
-                case T_FAVS: {
-                    List<Track> favs = MediaRepo.byIds(new ArrayList<>(Store.favs(this)));
-                    Collections.sort(favs, (a, b) -> a.title.compareToIgnoreCase(b.title));
-                    addTracks(rows, favs);
-                    break;
-                }
-                case T_PLAYLISTS: {
-                    rows.add(new Row(R_NEWPL));
-                    LinkedHashMap<String, List<Long>> pls = Store.playlists(this);
-                    for (String name : pls.keySet()) {
-                        if (!query.isEmpty() && !name.toLowerCase(Locale.ROOT).contains(query)) continue;
-                        Row r = new Row(R_PLAYLIST);
-                        r.name = name;
-                        r.tracks = MediaRepo.byIds(pls.get(name));
-                        r.sub = r.tracks.size() + (r.tracks.size() > 1 ? " titres" : " titre");
-                        rows.add(r);
+        try {
+            viz = new Visualizer(s.audioSessionId());
+            viz.setCaptureSize(Visualizer.getCaptureSizeRange()[1]);
+            viz.setDataCaptureListener(new Visualizer.OnDataCaptureListener() {
+                @Override public void onWaveFormDataCapture(Visualizer v, byte[] w, int r) {}
+                @Override public void onFftDataCapture(Visualizer v, byte[] fft, int r) {
+                    Native.fft(fft, vizLevels);
+                    long now = System.currentTimeMillis();
+                    if (now - lastVizPush < 30) return;
+                    lastVizPush = now;
+                    StringBuilder sb = new StringBuilder("[");
+                    for (int i = 0; i < vizLevels.length; i++) {
+                        if (i > 0) sb.append(',');
+                        sb.append(Math.round(vizLevels[i] * 1000) / 1000f);
                     }
-                    break;
+                    emit("viz", sb.append(']').toString());
                 }
-                case T_RECENT: addTracks(rows, MediaRepo.byIds(Store.recent(this))); break;
-            }
-        }
-        for (Row r : rows) if (r.type == R_TRACK) shownTracks.add(r.track);
-
-        String empty;
-        if (!query.isEmpty()) empty = "Aucun résultat pour « " + query + " »";
-        else if (detailTracks != null) empty = detailPlaylist ? "Playlist vide.\nAppui long sur une chanson → « Ajouter à une playlist »" : "Rien ici";
-        else if (tab == T_FAVS) empty = "Pas encore de favoris.\nAppuie sur ♥ dans le lecteur.";
-        else if (tab == T_RECENT) empty = "Rien écouté pour l'instant";
-        else empty = "Aucune musique trouvée.\nAjoute des fichiers audio sur ton téléphone, ils apparaîtront ici tout seuls.";
-        show(rows, empty);
-    }
-
-    private void show(List<Row> rows, String emptyText) {
-        int audio = 0;
-        for (Track t : shownTracks) if (!t.video) audio++;
-        shuffleBtn.setVisibility(audio > 1 ? View.VISIBLE : View.GONE);
-        shuffleBtn.setText("⇄   Lecture aléatoire  ·  " + audio + " titres");
-        emptyView.setText(emptyText);
-        boolean onlyAdd = rows.size() == 1 && rows.get(0).type == R_ADD;
-        emptyView.setVisibility(rows.isEmpty() || onlyAdd ? View.VISIBLE : View.GONE);
-        adapter.set(rows);
-    }
-
-    private void openDetail(String name, List<Track> tracks, boolean playlist) {
-        detailName = name;
-        detailTracks = tracks;
-        detailPlaylist = playlist;
-        refresh();
-        list.setSelection(0);
-    }
-
-    private void closeDetail() {
-        detailTracks = null;
-        detailPlaylist = false;
-        refresh();
-    }
-
-    private List<Track> audioOf(List<Track> l) {
-        List<Track> q = new ArrayList<>();
-        for (Track t : l) if (!t.video) q.add(t);
-        return q;
-    }
-
-    private void shuffleAll() {
-        List<Track> q = audioOf(shownTracks);
-        if (q.isEmpty()) return;
-        PlayerService s = PlayerService.get();
-        if (s != null && !s.shuffle()) s.setShuffle(true);
-        else if (s == null) Store.putBool(this, "shuffle", true);
-        PlayerService.playQueue(this, q, (int) (Math.random() * q.size()));
-    }
-
-    private void playTrack(Track t) {
-        List<Track> q = audioOf(shownTracks);
-        int i = q.indexOf(t);
-        if (i < 0) { q = Collections.singletonList(t); i = 0; }
-        PlayerService.playQueue(this, q, i);
-    }
-
-    private void onRowClick(Row r) {
-        switch (r.type) {
-            case R_TRACK: playTrack(r.track); break;
-            case R_GROUP: openDetail(r.name, r.tracks, false); break;
-            case R_PLAYLIST: openDetail(r.name, r.tracks, true); break;
-            case R_NEWPL: newPlaylistDialog(null); break;
-            case R_ADD: addMusicMenu(); break;
+            }, Visualizer.getMaxCaptureRate(), false, true);
+            viz.setEnabled(true);
+        } catch (Throwable e) {
+            viz = null;
+            emit("viz", "null");
         }
     }
 
-    private void onRowLongClick(Row r) {
-        if (r.type == R_TRACK) trackOptions(r.track);
-        else if (r.type == R_PLAYLIST) playlistOptions(r.name, r.tracks);
-        else if (r.type == R_GROUP) {
-            Opts o = new Opts();
-            o.add("▶  Tout lire", () -> PlayerService.playQueue(this, r.tracks, 0));
-            o.add("Ajouter à la file d'attente", () -> { for (Track t : r.tracks) addToQueue(t); });
-            o.show(r.name);
-        }
+    private void stopViz() {
+        if (viz == null) return;
+        try { viz.setEnabled(false); viz.release(); } catch (Throwable ignored) {}
+        viz = null;
     }
 
-    // =================================================================== Menus
-    private final class Opts {
-        final List<String> labels = new ArrayList<>();
-        final List<Runnable> actions = new ArrayList<>();
-        void add(String l, Runnable a) { labels.add(l); actions.add(a); }
-        void show(String title) {
-            new AlertDialog.Builder(MainActivity.this, Ui.DIALOG).setTitle(title)
-                    .setItems(labels.toArray(new String[0]), (d, w) -> actions.get(w).run()).show();
-        }
-    }
-
-    private void addToQueue(Track t) {
-        PlayerService s = PlayerService.get();
-        if (s != null) s.addToQueue(t); else PlayerService.playQueue(this, Collections.singletonList(t), 0);
-    }
-
-    private void trackOptions(Track t) {
-        TrackMenu.show(this, t, detailPlaylist ? detailName : null, () -> {
-            if (MainActivity.needsReload) { needsReload = false; loadMedia(); } else refresh();
-        });
-    }
-
-    private void playlistOptions(String name, List<Track> tracks) {
-        Opts o = new Opts();
-        o.add("▶  Lire", () -> PlayerService.playQueue(this, tracks, 0));
-        o.add("Renommer", () -> {
-            EditText in = input(name);
-            new AlertDialog.Builder(this, Ui.DIALOG).setTitle("Renommer").setView(wrap(in))
-                    .setNegativeButton("Annuler", null)
-                    .setPositiveButton("OK", (d, w) -> {
-                        String n = in.getText().toString().trim();
-                        if (!n.isEmpty()) { Store.renamePlaylist(this, name, n); refresh(); }
-                    }).show();
-        });
-        o.add("Supprimer", () -> new AlertDialog.Builder(this, Ui.DIALOG).setTitle("Supprimer « " + name + " » ?")
-                .setNegativeButton("Annuler", null)
-                .setPositiveButton("Supprimer", (d, w) -> { Store.deletePlaylist(this, name); refresh(); }).show());
-        o.show(name);
-    }
-
-    private EditText input(String text) {
-        EditText in = new EditText(this);
-        in.setSingleLine(true);
-        in.setText(text);
-        in.setTextColor(Ui.TEXT);
-        in.setHintTextColor(Ui.SUB);
-        if (text != null) in.setSelection(text.length());
-        return in;
-    }
-
-    private View wrap(View v) {
-        LinearLayout box = new LinearLayout(this);
-        box.setOrientation(LinearLayout.VERTICAL);
-        int p = Ui.dp(this, 22);
-        box.setPadding(p, p / 2, p, 0);
-        box.addView(v, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-        return box;
-    }
-
-    private void newPlaylistDialog(Track toAdd) {
-        EditText in = input("");
-        in.setHint("Nom de la playlist");
-        new AlertDialog.Builder(this, Ui.DIALOG).setTitle("Nouvelle playlist").setView(wrap(in))
-                .setNegativeButton("Annuler", null)
-                .setPositiveButton("Créer", (d, w) -> {
-                    String n = in.getText().toString().trim();
-                    if (n.isEmpty()) return;
-                    if (!Store.createPlaylist(this, n)) { Ui.toast(this, "Cette playlist existe déjà"); }
-                    if (toAdd != null) { Store.addToPlaylist(this, n, toAdd.id); Ui.toast(this, "Ajouté à « " + n + " »"); }
-                    refresh();
-                }).show();
-    }
-
-    private void pickPlaylist(Track t) {
-        List<String> names = new ArrayList<>(Store.playlists(this).keySet());
-        Opts o = new Opts();
-        o.add("＋  Nouvelle playlist", () -> newPlaylistDialog(t));
-        for (String n : names) {
-            o.add(n, () -> Ui.toast(this, Store.addToPlaylist(this, n, t.id) ? "Ajouté à « " + n + " »" : "Déjà dans « " + n + " »"));
-        }
-        o.show("Ajouter à…");
-    }
-
-    private void share(Track t) {
-        Intent i = new Intent(Intent.ACTION_SEND);
-        i.setType("audio/*");
-        i.putExtra(Intent.EXTRA_STREAM, t.uri());
-        i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
-        startActivity(Intent.createChooser(i, "Partager « " + t.title + " »"));
-    }
-
-    private void info(Track t) {
-        String msg = "Titre : " + t.title
-                + (t.video ? "" : "\nArtiste : " + t.artist + "\nAlbum : " + t.album)
-                + "\nDurée : " + Ui.time(t.duration)
-                + "\nDossier : " + t.folder
-                + "\n\n" + t.path;
-        new AlertDialog.Builder(this, Ui.DIALOG).setTitle("Infos").setMessage(msg).setPositiveButton("OK", null).show();
-    }
-
-    // =================================================================== Ajouter de la musique
-    private void addMusicMenu() {
-        Opts o = new Opts();
-        o.add("📁  Importer des fichiers audio", () -> {
-            Intent i = new Intent(Intent.ACTION_GET_CONTENT);
-            i.setType("audio/*");
-            i.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
-            startActivityForResult(Intent.createChooser(i, "Choisir des musiques"), REQ_IMPORT);
-        });
-        o.add("🎬  Convertir une vidéo en audio", () -> {
-            Intent i = new Intent(Intent.ACTION_GET_CONTENT);
-            i.setType("video/*");
-            startActivityForResult(Intent.createChooser(i, "Choisir une vidéo"), REQ_VIDEO);
-        });
-        o.add("🔗  Importer depuis un lien direct", () -> ToolsUi.importLinkDialog(this));
-        o.show("Ajouter plus de musique");
-    }
-
-    // =================================================================== Modifier une musique
-    private void editDialog(Track t) {
-        LinearLayout box = new LinearLayout(this);
-        box.setOrientation(LinearLayout.VERTICAL);
-        int p = Ui.dp(this, 22);
-        box.setPadding(p, p / 2, p, 0);
-
-        LinearLayout coverRow = new LinearLayout(this);
-        coverRow.setGravity(Gravity.CENTER_VERTICAL);
-        CoverView cv = new CoverView(this, 12, 26);
-        cv.bind(t, 300);
-        int cs = Ui.dp(this, 84);
-        coverRow.addView(cv, new LinearLayout.LayoutParams(cs, cs));
-        LinearLayout btns = new LinearLayout(this);
-        btns.setOrientation(LinearLayout.VERTICAL);
-        btns.setPadding(Ui.dp(this, 14), 0, 0, 0);
-        AlertDialog[] holder = new AlertDialog[1];
-        btns.addView(Ui.chip(this, "🖼  Changer la photo", v -> {
-            coverTarget = t;
-            if (holder[0] != null) holder[0].dismiss();
-            Intent i = new Intent(Intent.ACTION_GET_CONTENT);
-            i.setType("image/*");
-            startActivityForResult(Intent.createChooser(i, "Choisir une photo"), REQ_COVER);
-        }));
-        TextView reset = Ui.chip(this, "Photo d'origine", v -> {
-            Store.coverFile(this, t.id).delete();
-            t.coverStamp = System.currentTimeMillis();
-            cv.bind(t, 300);
-            refresh();
-        });
-        LinearLayout.LayoutParams rl = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        rl.topMargin = Ui.dp(this, 8);
-        btns.addView(reset, rl);
-        coverRow.addView(btns);
-        box.addView(coverRow);
-
-        EditText title = field(box, "Titre", t.title);
-        EditText artist = field(box, "Artiste", t.artist);
-        EditText album = field(box, "Album", t.album);
-
-        holder[0] = new AlertDialog.Builder(this, Ui.DIALOG).setTitle("✎  Modifier")
-                .setView(box)
-                .setNegativeButton("Annuler", null)
-                .setPositiveButton("Enregistrer", (d, w) -> {
-                    String ti = title.getText().toString().trim();
-                    String ar = artist.getText().toString().trim();
-                    String al = album.getText().toString().trim();
-                    if (!ti.isEmpty()) t.title = ti;
-                    if (!ar.isEmpty()) t.artist = ar;
-                    if (!al.isEmpty()) t.album = al;
-                    Store.saveEdits(this, t);
-                    refresh();
-                    onPlayerChanged();
-                    Ui.toast(this, "✓ Modifié");
-                }).show();
-    }
-
-    private EditText field(LinearLayout box, String label, String value) {
-        TextView l = Ui.text(this, label, 12, Ui.SUB, false);
-        l.setPadding(0, Ui.dp(this, 14), 0, 0);
-        box.addView(l);
-        EditText e = input(value);
-        box.addView(e, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-        return e;
-    }
-
+    // =================================================================== Résultats d'activités
     @Override
     @SuppressWarnings("deprecation")
     protected void onActivityResult(int req, int res, Intent data) {
         super.onActivityResult(req, res, data);
-        if (res == RESULT_OK && data != null && req == REQ_VIDEO && data.getData() != null) {
-            ToolsUi.convertToAudio(this, Track.fromUri(this, data.getData(), true));
+        if (req == REQ_DELETE) {
+            if (res == RESULT_OK && pendingDelete != null) {
+                for (Track t : pendingDelete) Store.setInSet(this, "trash", t.id, false);
+                toast("Supprimé définitivement");
+            }
+            pendingDelete = null;
+            loadMedia();
             return;
         }
-        if (res == RESULT_OK && data != null && req == REQ_IMPORT) {
-            List<Uri> uris = new ArrayList<>();
-            if (data.getClipData() != null) {
-                for (int k = 0; k < data.getClipData().getItemCount(); k++) uris.add(data.getClipData().getItemAt(k).getUri());
-            } else if (data.getData() != null) uris.add(data.getData());
-            ToolsUi.importFiles(this, uris);
-            return;
+        if (res != RESULT_OK || data == null) return;
+        Uri u = data.getData();
+        switch (req) {
+            case REQ_COVER: {
+                if (u == null || coverTargetId < 0) return;
+                Track t = find(coverTargetId);
+                if (t == null) return;
+                new Thread(() -> {
+                    boolean ok = saveSquare(u, Store.coverFile(this, t.id));
+                    if (ok) t.coverStamp = System.currentTimeMillis();
+                    h.post(() -> {
+                        if (!ok) { toast("Impossible de lire cette image"); return; }
+                        emit("cover", trackJson(t).toString());
+                        loadMedia();
+                        PlayerService s = PlayerService.get();
+                        if (s != null) s.notifyQueueChanged();
+                    });
+                }).start();
+                break;
+            }
+            case REQ_IMPORT: {
+                List<Uri> uris = new ArrayList<>();
+                if (data.getClipData() != null) {
+                    for (int k = 0; k < data.getClipData().getItemCount(); k++) uris.add(data.getClipData().getItemAt(k).getUri());
+                } else if (u != null) uris.add(u);
+                if (uris.isEmpty()) return;
+                MediaTools.importFiles(this, uris, new MediaTools.Callback() {
+                    @Override public void progress(int p) { emit("progress", "{\"title\":" + JSONObject.quote("Import…") + ",\"pct\":" + p + "}"); }
+                    @Override public void done(Uri out, String err) {
+                        emit("progress", "{\"done\":true}");
+                        toast(err != null ? err : "✓ Ajouté à ta bibliothèque");
+                    }
+                });
+                break;
+            }
+            case REQ_VIDEO:
+                if (u != null) convertVideo(Track.fromUri(this, u, true));
+                break;
+            case REQ_SAVE:
+                if (u == null) return;
+                try (OutputStream os = getContentResolver().openOutputStream(u, "wt")) {
+                    os.write(Store.exportAll(this).getBytes(StandardCharsets.UTF_8));
+                    toast("✓ Sauvegarde créée");
+                } catch (Exception e) { toast("Échec de la sauvegarde"); }
+                break;
+            case REQ_RESTORE: {
+                if (u == null) return;
+                StringBuilder sb = new StringBuilder();
+                try (InputStream in = getContentResolver().openInputStream(u);
+                     BufferedReader br = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8))) {
+                    String line;
+                    while ((line = br.readLine()) != null) sb.append(line);
+                } catch (Exception e) { toast("Fichier illisible"); return; }
+                if (Store.importAll(this, sb.toString())) {
+                    toast("✓ Restauré");
+                    web.reload();
+                } else toast("Ce n'est pas une sauvegarde NOX Player");
+                break;
+            }
         }
-        if (req != REQ_COVER || res != RESULT_OK || data == null || data.getData() == null || coverTarget == null) return;
-        Track t = coverTarget;
-        Uri img = data.getData();
-        new Thread(() -> {
-            boolean ok = saveCover(img, Store.coverFile(this, t.id));
-            runOnUiThread(() -> {
-                if (ok) {
-                    t.coverStamp = System.currentTimeMillis();
-                    refresh();
-                    onPlayerChanged();
-                    Ui.toast(this, "✓ Photo changée");
-                    editDialog(t);
-                } else Ui.toast(this, "Impossible de lire cette image");
-            });
-        }).start();
     }
 
-    private boolean saveCover(Uri img, File dest) {
+    private boolean saveSquare(Uri img, File dest) {
         try {
             BitmapFactory.Options o = new BitmapFactory.Options();
             o.inJustDecodeBounds = true;
@@ -833,172 +516,349 @@ public class MainActivity extends Activity implements PlayerService.Listener {
         }
     }
 
-    // =================================================================== Tri
-    private void sortSheet() {
-        LinearLayout box = new LinearLayout(this);
-        box.setOrientation(LinearLayout.VERTICAL);
-        int cur = Store.getInt(this, "sort", 0);
-        boolean rev = Store.getBool(this, "sort_rev", false);
-        android.app.Dialog[] d = new android.app.Dialog[1];
-        for (int i = 0; i < MediaRepo.SORT_NAMES.length; i++) {
-            final int k = i;
-            LinearLayout r = new LinearLayout(this);
-            r.setGravity(Gravity.CENTER_VERTICAL);
-            r.setPadding(Ui.dp(this, 30), Ui.dp(this, 18), Ui.dp(this, 26), Ui.dp(this, 18));
-            r.setBackground(Ui.ripple(null));
-            TextView t = Ui.text(this, MediaRepo.SORT_NAMES[i], 19, i == cur ? Ui.ACCENT2 : 0xFFCCCCCC, false);
-            r.addView(t, new LinearLayout.LayoutParams(0, -2, 1));
-            if (i == cur) r.addView(Ui.text(this, rev ? "⇡" : "⇣", 22, Ui.ACCENT2, true));
-            r.setOnClickListener(v -> {
-                if (k == cur) Store.putBool(this, "sort_rev", !rev);
-                else { Store.putInt(this, "sort", k); Store.putBool(this, "sort_rev", false); }
-                d[0].dismiss();
-                tab = T_SONGS;
-                detailTracks = null;
-                styleTabs();
-                refresh();
-                list.setSelection(0);
+    // =================================================================== Interface exposée au JavaScript
+    /** Tout ce que l'interface JS a le droit de faire. Rien d'autre n'est accessible. */
+    private final class Bridge {
+        private void ui(Runnable r) { h.post(r); }
+
+        private PlayerService svc() { return PlayerService.get(); }
+
+        @JavascriptInterface public String version() { return "1.4"; }
+
+        @JavascriptInterface public void askPermission() { ui(MainActivity.this::askPerm); }
+
+        @JavascriptInterface public void openAppSettings() {
+            ui(() -> startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + getPackageName()))));
+        }
+
+        @JavascriptInterface public void reload() { ui(MainActivity.this::loadMedia); }
+
+        @JavascriptInterface public String state() { return stateJson().toString(); }
+
+        @JavascriptInterface public void toast(String s) { MainActivity.this.toast(s); }
+
+        // ----- Lecture
+        @JavascriptInterface public void play(String idsJson, int index) {
+            ui(() -> {
+                try {
+                    JSONArray a = new JSONArray(idsJson);
+                    List<Track> q = new ArrayList<>();
+                    for (int i = 0; i < a.length(); i++) { Track t = find(a.getLong(i)); if (t != null) q.add(t); }
+                    PlayerService.playQueue(MainActivity.this, q, Math.max(0, Math.min(index, q.size() - 1)));
+                } catch (Exception ignored) {}
             });
-            box.addView(r);
-        }
-        d[0] = Ui.sheet(this, "Tri des chansons", box);
-    }
-
-    private void hideKeyboard() {
-        ((android.view.inputmethod.InputMethodManager) getSystemService(INPUT_METHOD_SERVICE))
-                .hideSoftInputFromWindow(search.getWindowToken(), 0);
-    }
-
-    // =================================================================== Réglages
-    private void settingsDialog() {
-        boolean auto = Store.getBool(this, "auto_audio", false);
-        Opts o = new Opts();
-        o.add((auto ? "☑" : "☐") + "  Nouvelles vidéos du téléphone → audio automatiquement", () -> {
-            Store.putBool(this, "auto_audio", !auto);
-            int newest = 0;
-            for (Track v : MediaRepo.videos) newest = (int) Math.max(newest, v.dateAdded);
-            Store.putInt(this, "video_seen", newest);
-            Ui.toast(this, !auto ? "Activé : chaque nouvelle vidéo sera aussi ajoutée en audio" : "Désactivé");
-        });
-        o.add("🔗  Importer depuis un lien direct", () -> ToolsUi.importLinkDialog(this));
-        o.add("⟳  Rescanner la bibliothèque", () -> { loadMedia(); Ui.toast(this, "Scan en cours…"); });
-        o.add("À propos", () -> new AlertDialog.Builder(this, Ui.DIALOG).setTitle("NOX Player")
-                .setMessage("Lecteur de musique.\nVersion 1.0\n\nfait par math_0235").setPositiveButton("OK", null).show());
-        o.show("Réglages");
-    }
-
-    // =================================================================== Mini-lecteur
-    @Override
-    public void onPlayerChanged() {
-        PlayerService s = PlayerService.get();
-        Track t = s != null ? s.current() : null;
-        if (t == null) { mini.setVisibility(View.GONE); adapter.notifyDataSetChanged(); return; }
-        mini.setVisibility(View.VISIBLE);
-        miniTitle.setText(t.title);
-        miniSub.setText(t.artist);
-        miniCover.bind(t, Ui.dp(this, 46));
-        miniPlay.setKind(s.isPlaying() ? IconView.PAUSE : IconView.PLAY);
-        updateMiniProgress();
-        adapter.notifyDataSetChanged();
-    }
-
-    private void updateMiniProgress() {
-        PlayerService s = PlayerService.get();
-        if (s == null || s.current() == null) return;
-        int d = s.duration();
-        float f = d > 0 ? s.position() / (float) d : 0f;
-        miniProg.setProgress((int) (f * 1000));
-        miniPlay.setRing(f);
-    }
-
-    // =================================================================== Adaptateur de liste
-    private final class RowAdapter extends BaseAdapter {
-        private List<Row> rows = new ArrayList<>();
-
-        void set(List<Row> r) { rows = r; notifyDataSetChanged(); }
-        Row get(int i) { return rows.get(i); }
-
-        @Override public int getCount() { return rows.size(); }
-        @Override public Object getItem(int i) { return rows.get(i); }
-        @Override public long getItemId(int i) { return i; }
-
-        final class Holder {
-            CoverView cover;
-            TextView t1, t2, more;
         }
 
-        @Override
-        public View getView(int i, View cv, ViewGroup parent) {
-            Holder hd;
-            int cs = Ui.dp(MainActivity.this, 50);
-            if (cv == null) {
-                LinearLayout row = new LinearLayout(MainActivity.this);
-                row.setGravity(Gravity.CENTER_VERTICAL);
-                int p = Ui.dp(MainActivity.this, 16);
-                row.setPadding(p, Ui.dp(MainActivity.this, 7), Ui.dp(MainActivity.this, 4), Ui.dp(MainActivity.this, 7));
-                row.setBackground(Ui.ripple(null));
-                hd = new Holder();
-                hd.cover = new CoverView(MainActivity.this, 10, 18);
-                row.addView(hd.cover, new LinearLayout.LayoutParams(cs, cs));
-                LinearLayout col = new LinearLayout(MainActivity.this);
-                col.setOrientation(LinearLayout.VERTICAL);
-                col.setPadding(Ui.dp(MainActivity.this, 14), 0, Ui.dp(MainActivity.this, 6), 0);
-                hd.t1 = Ui.text(MainActivity.this, "", 15, Ui.TEXT, true);
-                hd.t1.setSingleLine(true);
-                hd.t1.setEllipsize(android.text.TextUtils.TruncateAt.END);
-                hd.t2 = Ui.text(MainActivity.this, "", 12.5f, Ui.SUB, false);
-                hd.t2.setSingleLine(true);
-                hd.t2.setEllipsize(android.text.TextUtils.TruncateAt.END);
-                col.addView(hd.t1);
-                col.addView(hd.t2);
-                row.addView(col, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
-                hd.more = Ui.button(MainActivity.this, "⋮", 22, null);
-                hd.more.setTextColor(Ui.SUB);
-                int mb = Ui.dp(MainActivity.this, 44);
-                row.addView(hd.more, new LinearLayout.LayoutParams(mb, mb));
-                row.setTag(hd);
-                cv = row;
-            } else {
-                hd = (Holder) cv.getTag();
+        @JavascriptInterface public void cmd(String name, String arg) {
+            ui(() -> {
+                PlayerService s = svc();
+                if (s == null) return;
+                try {
+                    switch (name) {
+                        case "toggle": s.toggle(); break;
+                        case "next": s.next(true); break;
+                        case "prev": s.prev(); break;
+                        case "seek": s.seekTo(Integer.parseInt(arg)); break;
+                        case "mode": s.setMode(Integer.parseInt(arg)); break;
+                        case "shuffle": s.setShuffle(!s.shuffle()); break;
+                        case "repeat": s.cycleRepeat(); break;
+                        case "jump": s.jumpTo(Integer.parseInt(arg)); break;
+                        case "remove": s.removeFromQueue(Integer.parseInt(arg)); break;
+                        case "clear": s.clearQueue(); break;
+                        case "speed": s.setSpeed(Float.parseFloat(arg)); break;
+                        case "sleep": s.setSleep(Integer.parseInt(arg)); break;
+                        case "move": {
+                            String[] p = arg.split(",");
+                            s.moveInQueue(Integer.parseInt(p[0]), Integer.parseInt(p[1]));
+                            break;
+                        }
+                    }
+                } catch (Exception ignored) {}
+            });
+        }
+
+        @JavascriptInterface public void enqueue(long id, boolean next) {
+            ui(() -> {
+                Track t = find(id);
+                if (t == null) return;
+                PlayerService s = svc();
+                if (s == null || s.current() == null) PlayerService.playQueue(MainActivity.this, Collections.singletonList(t), 0);
+                else if (next) s.playNext(t);
+                else s.addToQueue(t);
+            });
+        }
+
+        // ----- Favoris / playlists
+        @JavascriptInterface public boolean fav(long id) {
+            boolean r = Store.toggleFav(MainActivity.this, id);
+            ui(MainActivity.this::onPlayerChanged);
+            return r;
+        }
+
+        @JavascriptInterface public void playlist(String action, String name, String arg) {
+            switch (action) {
+                case "create": Store.createPlaylist(MainActivity.this, name); break;
+                case "delete": Store.deletePlaylist(MainActivity.this, name); break;
+                case "rename": Store.renamePlaylist(MainActivity.this, name, arg); break;
+                case "add": Store.addToPlaylist(MainActivity.this, name, Long.parseLong(arg)); break;
+                case "remove": Store.removeFromPlaylist(MainActivity.this, name, Long.parseLong(arg)); break;
             }
-            Row r = rows.get(i);
-            hd.more.setOnClickListener(v -> onRowLongClick(r));
-            hd.more.setVisibility(r.type == R_NEWPL || r.type == R_ADD ? View.GONE : View.VISIBLE);
-            switch (r.type) {
-                case R_TRACK: {
-                    Track t = r.track;
-                    PlayerService s = PlayerService.get();
-                    Track cur = s != null ? s.current() : null;
-                    boolean playing = cur != null && cur.key().equals(t.key());
-                    hd.cover.bind(t, cs);
-                    hd.t1.setText((playing ? "♪  " : "") + t.title);
-                    hd.t1.setTextColor(playing ? Ui.ACCENT2 : Ui.TEXT);
-                    String fav = !t.video && Store.isFav(MainActivity.this, t.id) ? "♥  " : "";
-                    hd.t2.setText(fav + t.artist + "  ·  " + Ui.time(t.duration));
-                    break;
+        }
+
+        // ----- Modifier une chanson
+        @JavascriptInterface public void edit(long id, String title, String artist, String album) {
+            Track t = find(id);
+            if (t == null) return;
+            if (!title.trim().isEmpty()) t.title = title.trim();
+            t.artist = artist.trim().isEmpty() ? "Artiste inconnu" : artist.trim();
+            t.album = album.trim().isEmpty() ? "Album inconnu" : album.trim();
+            Store.saveEdits(MainActivity.this, t);
+            ui(() -> { loadMedia(); PlayerService s = svc(); if (s != null) s.notifyQueueChanged(); });
+        }
+
+        @JavascriptInterface public void pickCover(long id) {
+            coverTargetId = id;
+            ui(() -> {
+                Intent i = new Intent(Intent.ACTION_GET_CONTENT).setType("image/*");
+                startActivityForResult(Intent.createChooser(i, "Choisir une photo"), REQ_COVER);
+            });
+        }
+
+        @JavascriptInterface public void resetCover(long id) {
+            Track t = find(id);
+            if (t == null) return;
+            Store.coverFile(MainActivity.this, id).delete();
+            t.coverStamp = System.currentTimeMillis();
+            ui(() -> { emit("cover", trackJson(t).toString()); loadMedia(); });
+        }
+
+        // ----- Masquer / corbeille
+        @JavascriptInterface public void setFlag(String set, long id, boolean on) {
+            if (!"hidden".equals(set) && !"trash".equals(set)) return;
+            Store.setInSet(MainActivity.this, set, id, on);
+            ui(MainActivity.this::loadMedia);
+        }
+
+        @JavascriptInterface public void deleteForever(String idsJson) {
+            ui(() -> {
+                List<Track> l = new ArrayList<>();
+                try {
+                    JSONArray a = new JSONArray(idsJson);
+                    for (int i = 0; i < a.length(); i++) { Track t = find(a.getLong(i)); if (t != null) l.add(t); }
+                } catch (Exception ignored) {}
+                if (l.isEmpty()) return;
+                pendingDelete = l;
+                if (Build.VERSION.SDK_INT >= 30) {
+                    List<Uri> uris = new ArrayList<>();
+                    for (Track t : l) uris.add(t.uri());
+                    try {
+                        PendingIntent pi = MediaStore.createDeleteRequest(getContentResolver(), uris);
+                        startIntentSenderForResult(pi.getIntentSender(), REQ_DELETE, null, 0, 0, 0);
+                    } catch (Exception e) { MainActivity.this.toast("Suppression impossible"); }
+                } else {
+                    for (Track t : l) {
+                        try {
+                            if (getContentResolver().delete(t.uri(), null, null) > 0) Store.setInSet(MainActivity.this, "trash", t.id, false);
+                        } catch (Exception ignored) {}
+                    }
+                    pendingDelete = null;
+                    loadMedia();
                 }
-                case R_GROUP:
-                case R_PLAYLIST:
-                    if (r.tracks != null && !r.tracks.isEmpty()) hd.cover.bind(r.tracks.get(0), cs);
-                    else hd.cover.bindLetter("♫", Ui.colorFor(r.name));
-                    hd.t1.setText(r.name);
-                    hd.t1.setTextColor(Ui.TEXT);
-                    hd.t2.setText(r.sub);
-                    break;
-                case R_ADD:
-                    hd.cover.bindLetter("＋", 0xFF2A2140);
-                    hd.t1.setText("Ajouter plus de musique");
-                    hd.t1.setTextColor(Ui.SUB);
-                    hd.t2.setText("Importer · vidéo → audio · lien");
-                    break;
-                case R_NEWPL:
-                    hd.cover.bindLetter("＋", Ui.ACCENT);
-                    hd.t1.setText("Nouvelle playlist");
-                    hd.t1.setTextColor(Ui.ACCENT2);
-                    hd.t2.setText("Crée ta propre liste");
-                    break;
+            });
+        }
+
+        // ----- Ajouter de la musique
+        @JavascriptInterface public void importFiles() {
+            ui(() -> {
+                Intent i = new Intent(Intent.ACTION_GET_CONTENT).setType("audio/*").putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+                startActivityForResult(Intent.createChooser(i, "Choisir des musiques"), REQ_IMPORT);
+            });
+        }
+
+        @JavascriptInterface public void convertVideo() {
+            ui(() -> {
+                Intent i = new Intent(Intent.ACTION_GET_CONTENT).setType("video/*");
+                startActivityForResult(Intent.createChooser(i, "Choisir une vidéo"), REQ_VIDEO);
+            });
+        }
+
+        @JavascriptInterface public String download(String url) {
+            return MediaTools.downloadLink(MainActivity.this, url);
+        }
+
+        // ----- Réglages
+        @JavascriptInterface public String pref(String key, String def) {
+            return Store.getString(MainActivity.this, "js_" + key, def);
+        }
+
+        @JavascriptInterface public void setPref(String key, String val) {
+            Store.putString(MainActivity.this, "js_" + key, val);
+        }
+
+        @JavascriptInterface public boolean flag(String key, boolean def) {
+            return Store.getBool(MainActivity.this, key, def);
+        }
+
+        @JavascriptInterface public void setFlagPref(String key, boolean on) {
+            if (!key.matches("pause_unplug|skip_short|auto_audio")) return;
+            Store.putBool(MainActivity.this, key, on);
+            if (key.equals("skip_short")) ui(MainActivity.this::loadMedia);
+            if (key.equals("auto_audio")) {
+                int newest = 0;
+                for (Track v : MediaRepo.videos) newest = (int) Math.max(newest, v.dateAdded);
+                Store.putInt(MainActivity.this, "video_seen", newest);
             }
-            return cv;
+        }
+
+        @JavascriptInterface public long listenMs() { return Store.listenMs(MainActivity.this); }
+
+        @JavascriptInterface public void backup(boolean save) {
+            ui(() -> {
+                Intent i;
+                if (save) {
+                    i = new Intent(Intent.ACTION_CREATE_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE)
+                            .setType("application/json").putExtra(Intent.EXTRA_TITLE, "NOX-Player-sauvegarde.json");
+                    startActivityForResult(i, REQ_SAVE);
+                } else {
+                    i = new Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*");
+                    startActivityForResult(i, REQ_RESTORE);
+                }
+            });
+        }
+
+        @JavascriptInterface public void notificationSettings() {
+            ui(() -> startActivity(new Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                    .putExtra(Settings.EXTRA_APP_PACKAGE, getPackageName())));
+        }
+
+        // ----- Égaliseur
+        @JavascriptInterface public String eq() {
+            JSONObject o = new JSONObject();
+            PlayerService s = svc();
+            try {
+                if (s == null || s.eq() == null) return o.put("ok", false).toString();
+                Equalizer e = s.eq();
+                short[] r = e.getBandLevelRange();
+                JSONArray bands = new JSONArray(), presets = new JSONArray();
+                for (short b = 0; b < e.getNumberOfBands(); b++)
+                    bands.put(new JSONObject().put("hz", e.getCenterFreq(b) / 1000).put("level", e.getBandLevel(b)));
+                for (short p = 0; p < e.getNumberOfPresets(); p++) presets.put(e.getPresetName(p));
+                BassBoost bb = s.bass();
+                o.put("ok", true).put("on", e.getEnabled()).put("min", r[0]).put("max", r[1])
+                        .put("bands", bands).put("presets", presets)
+                        .put("bass", bb != null && bb.getStrengthSupported() ? bb.getRoundedStrength() : -1);
+            } catch (Throwable t) {
+                try { o.put("ok", false); } catch (Exception ignored) {}
+            }
+            return o.toString();
+        }
+
+        @JavascriptInterface public void eqSet(String what, int a, int b) {
+            ui(() -> {
+                PlayerService s = svc();
+                if (s == null) return;
+                switch (what) {
+                    case "on": s.setFxEnabled(a != 0); break;
+                    case "band": s.setBand((short) a, (short) b); break;
+                    case "preset": s.usePreset((short) a); break;
+                    case "bass": s.setBass((short) a); break;
+                }
+            });
+        }
+
+        // ----- Paroles (C++ pour le .lrc)
+        @JavascriptInterface public String lyrics(long id) {
+            Track t = find(id);
+            if (t == null) return "[]";
+            String saved = Store.getString(MainActivity.this, "lyrics_" + t.key(), null);
+            if (saved == null && t.path != null && !t.path.isEmpty()) {
+                int dot = t.path.lastIndexOf('.');
+                String base = dot > 0 ? t.path.substring(0, dot) : t.path;
+                for (String ext : new String[]{".lrc", ".txt"}) {
+                    File f = new File(base + ext);
+                    if (!f.canRead()) continue;
+                    StringBuilder sb = new StringBuilder();
+                    try (BufferedReader br = new BufferedReader(new FileReader(f))) {
+                        String line;
+                        while ((line = br.readLine()) != null) sb.append(line).append('\n');
+                        saved = sb.toString();
+                        break;
+                    } catch (Exception ignored) {}
+                }
+            }
+            if (saved == null || saved.trim().isEmpty()) return "[]";
+            return Native.lrc(saved);
+        }
+
+        @JavascriptInterface public String lyricsRaw(long id) {
+            Track t = find(id);
+            return t == null ? "" : Store.getString(MainActivity.this, "lyrics_" + t.key(), "");
+        }
+
+        @JavascriptInterface public void saveLyrics(long id, String text) {
+            Track t = find(id);
+            if (t != null) Store.putString(MainActivity.this, "lyrics_" + t.key(), text.trim());
+        }
+
+        // ----- Couleurs (C++) et onde (C++)
+        @JavascriptInterface public String palette(long id) {
+            Track t = find(id);
+            Bitmap b = t == null ? null : ArtLoader.decode(MainActivity.this, t, 64);
+            if (b == null) return "null";
+            Bitmap sm = Bitmap.createScaledBitmap(b, 24, 24, true);
+            int[] px = new int[24 * 24];
+            sm.getPixels(px, 0, 24, 0, 0, 24, 24);
+            int[] c = Native.palette(px);
+            return String.format("[\"#%06X\",\"#%06X\"]", c[0] & 0xFFFFFF, c[1] & 0xFFFFFF);
+        }
+
+        @JavascriptInterface public String wave(long seed) {
+            float[] w = Native.wave(seed, 48);
+            StringBuilder sb = new StringBuilder("[");
+            for (int i = 0; i < w.length; i++) { if (i > 0) sb.append(','); sb.append(Math.round(w[i] * 1000) / 1000f); }
+            return sb.append(']').toString();
+        }
+
+        // ----- Visualiseur
+        @JavascriptInterface public void viz(boolean on) {
+            ui(() -> {
+                if (!on) { stopViz(); return; }
+                if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                    requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQ_MIC);
+                } else startViz();
+            });
+        }
+
+        // ----- Partager / sonnerie
+        @JavascriptInterface public void share(long id) {
+            Track t = find(id);
+            if (t == null) return;
+            ui(() -> {
+                Intent i = new Intent(Intent.ACTION_SEND).setType("audio/*").putExtra(Intent.EXTRA_STREAM, t.uri())
+                        .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                startActivity(Intent.createChooser(i, "Partager « " + t.title + " »"));
+            });
+        }
+
+        /** @return "ok", "perm" (autorisation à donner) ou "err" */
+        @JavascriptInterface public String ringtone(long id) {
+            Track t = find(id);
+            if (t == null || t.id < 0) return "err";
+            if (!Settings.System.canWrite(MainActivity.this)) {
+                ui(() -> startActivity(new Intent(Settings.ACTION_MANAGE_WRITE_SETTINGS, Uri.parse("package:" + getPackageName()))));
+                return "perm";
+            }
+            try {
+                try {
+                    ContentValues v = new ContentValues();
+                    v.put(MediaStore.Audio.Media.IS_RINGTONE, 1);
+                    getContentResolver().update(t.uri(), v, null, null);
+                } catch (Exception ignored) {}
+                RingtoneManager.setActualDefaultRingtoneUri(MainActivity.this, RingtoneManager.TYPE_RINGTONE, t.uri());
+                return "ok";
+            } catch (Exception e) {
+                return "err";
+            }
         }
     }
 }

@@ -46,7 +46,7 @@ public final class ArtLoader {
         });
     }
 
-    private static Bitmap decode(Context c, Track t, int size) {
+    public static Bitmap decode(Context c, Track t, int size) {
         java.io.File custom = t.customCover(c);
         if (custom != null) {
             BitmapFactory.Options o = new BitmapFactory.Options();

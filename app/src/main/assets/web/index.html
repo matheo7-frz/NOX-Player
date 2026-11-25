@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'none'; object-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'">
+<title>NOX Player</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<!-- NOX Player — interface en JavaScript — fait par math_0235 -->
+<div id="lib" class="screen">
+  <header class="top">
+    <img class="logo" src="logo.jpg" alt="">
+    <div class="brand"><h1>NOX Player</h1><small>fait par math_0235</small></div>
+    <button class="ib" id="bSearch" aria-label="Rechercher"></button>
+    <button class="ib" id="bSort" aria-label="Trier"></button>
+    <button class="ib" id="bSettings" aria-label="Paramètres"></button>
+  </header>
+  <div class="searchbox hidden" id="searchBox"><input id="search" type="search" placeholder="Rechercher une chanson, un artiste…" autocomplete="off"></div>
+  <nav class="tabs" id="tabs"></nav>
+  <div class="backbar hidden" id="backBar"></div>
+  <button class="shuffle hidden" id="bShuffleAll"></button>
+  <div class="list" id="list"></div>
+  <div class="empty hidden" id="empty"></div>
+</div>
+
+<div id="mini" class="mini hidden">
+  <div class="mcov" id="miniCov"></div>
+  <div class="mtxt"><b id="miniTitle"></b><small id="miniArtist"></small></div>
+  <button class="ring" id="miniPlay"><svg viewBox="0 0 48 48"><circle class="rbg" cx="24" cy="24" r="21"/><circle class="rfg" id="miniRing" cx="24" cy="24" r="21"/></svg><span id="miniIcon"></span></button>
+  <button class="ib" id="miniNext"></button>
+</div>
+
+<div id="player" class="layer hidden">
+  <div class="pwrap">
+    <button class="ib down" id="pDown"></button>
+    <div class="pcov" id="pCov"></div>
+    <h2 id="pTitle" class="marquee"></h2>
+    <div class="pArtist" id="pArtist"></div>
+    <div class="pactions">
+      <button class="ib small" id="pShuffle"></button>
+      <button class="ib small" id="pRepeat"></button>
+      <span class="grow"></span>
+      <button class="ib" id="pFav"></button>
+      <button class="ib" id="pMore"></button>
+    </div>
+    <span class="grow"></span>
+    <canvas id="pWave" height="46"></canvas>
+    <input type="range" id="pSeek" min="0" max="1000" value="0">
+    <div class="times"><span id="pCur">0:00</span><span id="pDur">0:00</span></div>
+    <div class="controls">
+      <button class="ib big2" id="pPrev"></button>
+      <button class="ib big" id="pPlay"></button>
+      <button class="ib big2" id="pNext"></button>
+    </div>
+    <div class="pbottom">
+      <button class="ib" id="pEq"></button>
+      <button class="lyrbtn" id="pLyrics">Paroles</button>
+      <button class="ib" id="pQueue"></button>
+    </div>
+    <div class="chips" id="pChips"></div>
+  </div>
+</div>
+
+<div id="queue" class="layer hidden">
+  <div class="qhead" id="qHead">
+    <div class="mcov" id="qCov"></div>
+    <div class="mtxt"><b id="qTitle"></b><div class="qbar"><i id="qProg"></i></div></div>
+    <button class="ib" id="qPlay"></button>
+  </div>
+  <div class="qsheet">
+    <button class="grip" id="qGrip"></button>
+    <div class="qtitle"><h2 id="qMode"></h2><button class="ib" id="qLocate"></button><button class="ib" id="qClear"></button></div>
+    <div class="list" id="qList"></div>
+    <div class="modes" id="qModes"></div>
+  </div>
+</div>
+
+<div id="page" class="layer page hidden"></div>
+<div id="viz" class="layer hidden"><canvas id="vizCanvas"></canvas><div class="vizInfo"><div class="vcov" id="vizCov"></div><b id="vizTitle"></b><small id="vizArtist"></small></div><button class="ib vclose" id="vizClose"></button></div>
+<div id="sheetBack" class="sheetBack hidden"><div class="sheet" id="sheet"></div></div>
+<div id="modalBack" class="modalBack hidden"><div class="modal" id="modal"></div></div>
+<div id="toast" class="toast hidden"></div>
+<div id="tamper" class="hidden"></div>
+
+<script src="app.js"></script>
+</body>
+</html>

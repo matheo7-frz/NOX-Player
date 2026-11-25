@@ -53,7 +53,7 @@ public class PlayerService extends Service implements MediaPlayer.OnPreparedList
     public static void removeListener(Listener l) { listeners.remove(l); }
 
     public static void playQueue(Context c, List<Track> q, int index) {
-        if (q == null || q.isEmpty() || !Guard.isOfficial(c)) return;
+        if (q == null || q.isEmpty() || !Native.ok(c)) return;
         PlayerService s = inst;
         if (s != null) { s.setQueue(q, index); return; }
         pendingQueue = new ArrayList<>(q);
@@ -530,7 +530,7 @@ public class PlayerService extends Service implements MediaPlayer.OnPreparedList
     private Notification buildNotification() {
         Track t = current();
         boolean p = isPlaying();
-        PendingIntent open = PendingIntent.getActivity(this, 0, new Intent(this, PlayerActivity.class),
+        PendingIntent open = PendingIntent.getActivity(this, 0, new Intent(this, MainActivity.class).putExtra("openPlayer", true).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
                 PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
         Notification.Builder b = new Notification.Builder(this, CHANNEL)
                 .setSmallIcon(android.R.drawable.ic_media_play)
