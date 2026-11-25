@@ -1,0 +1,10 @@
+.gradle/
+build/
+local.properties
+*.iml
+.idea/
+# JAMAIS de clé dans le dépôt
+*.jks
+*.keystore
+keystore.properties
+KEYSTORE_BASE64.txt
