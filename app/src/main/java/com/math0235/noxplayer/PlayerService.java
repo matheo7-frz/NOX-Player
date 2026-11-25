@@ -527,13 +527,20 @@ public class PlayerService extends Service implements MediaPlayer.OnPreparedList
         return new Notification.Action.Builder(Icon.createWithResource(this, icon), title, servicePi(act, code)).build();
     }
 
+    /** Icône NOX de la barre de notifications (le logo couleur vient de l'icône de l'appli). */
+    private int smallIcon() {
+        int id = getResources().getIdentifier("ic_stat_nox", "drawable", getPackageName());
+        return id != 0 ? id : android.R.drawable.ic_media_play;
+    }
+
     private Notification buildNotification() {
         Track t = current();
         boolean p = isPlaying();
         PendingIntent open = PendingIntent.getActivity(this, 0, new Intent(this, MainActivity.class).putExtra("openPlayer", true).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
                 PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
         Notification.Builder b = new Notification.Builder(this, CHANNEL)
-                .setSmallIcon(android.R.drawable.ic_media_play)
+                .setSmallIcon(smallIcon())
+                .setColor(0xFFB14CFF)
                 .setContentTitle(t != null ? t.title : "NOX Player")
                 .setContentText(t != null ? t.artist : "")
                 .setContentIntent(open)

@@ -523,7 +523,7 @@ public class MainActivity extends Activity implements PlayerService.Listener {
 
         private PlayerService svc() { return PlayerService.get(); }
 
-        @JavascriptInterface public String version() { return "1.4"; }
+        @JavascriptInterface public String version() { return "1.4.1"; }
 
         @JavascriptInterface public void askPermission() { ui(MainActivity.this::askPerm); }
 
